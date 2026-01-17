@@ -13,7 +13,7 @@ from typing import Tuple, Optional
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 os.chdir(SCRIPT_DIR)
 
-# Suppress Pydantic warnings (Clean up logs)
+# Suppress Pydantic warnings to keep logs clean
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
 
 # --- 2. LOGGING ---
@@ -27,12 +27,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MouryanBot")
 
-# --- 3. DEPENDENCY CHECK ---
+# --- 3. DEPENDENCIES ---
 try:
     from dotenv import load_dotenv
     from aiogram import Bot, Dispatcher, F, types
     from aiogram.filters import Command, CommandStart, CommandObject
-    from aiogram.types import Message, FSInputFile
+    from aiogram.types import Message
     from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
     from aiogram.client.default import DefaultBotProperties
     from aiogram.client.session.aiohttp import AiohttpSession
@@ -45,7 +45,7 @@ except ImportError as e:
 # Load Environment
 load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 
-# --- 4. CONFIG ---
+# --- 4. CONFIGURATION ---
 def get_env(key, required=True):
     val = os.getenv(key)
     if required and not val:
@@ -61,7 +61,7 @@ except ValueError:
     sys.exit(1)
 BOT_USERNAME = get_env("BOT_USERNAME", "Bot").replace("@", "")
 
-# --- 5. DATABASE ---
+# --- 5. DATABASE MANAGER ---
 class Database:
     def __init__(self, db_name="database.db"):
         self.path = os.path.join(SCRIPT_DIR, db_name)
@@ -73,6 +73,7 @@ class Database:
     def init_db(self):
         with self.conn:
             self.conn.execute("PRAGMA journal_mode=WAL")
+            # Files Table
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS files (
                     code TEXT PRIMARY KEY,
@@ -86,6 +87,7 @@ class Database:
                     is_active INTEGER DEFAULT 1
                 )
             """)
+            # Users Table
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -95,6 +97,7 @@ class Database:
             self.conn.execute("CREATE INDEX IF NOT EXISTS idx_unique_id ON files(file_unique_id)")
 
     async def execute(self, query: str, args: tuple = (), fetch: str = None):
+        """Thread-safe async database execution."""
         async with self.lock:
             def _run():
                 try:
@@ -114,10 +117,10 @@ class Database:
 db = Database()
 atexit.register(db.close)
 
-# --- 6. BOT INSTANCE (PYTHONANYWHERE PROXY FIX) ---
+# --- 6. BOT INSTANCE (PYTHONANYWHERE PROXY SUPPORT) ---
 session = None
 if os.getenv('PYTHONANYWHERE_DOMAIN') or os.getenv('PYTHONANYWHERE_SITE'):
-    # PythonAnywhere Free Tier requires this proxy
+    # Automatically use PythonAnywhere's proxy if detected
     session = AiohttpSession(proxy="http://proxy.server:3128")
     logger.info("🔧 Configured PythonAnywhere Proxy")
 
@@ -129,14 +132,27 @@ bot = Bot(
 dp = Dispatcher()
 
 # --- 7. HELPER FUNCTIONS ---
+RATE_LIMIT = {}
+
+def is_spamming(user_id: int) -> bool:
+    """Basic rate limiter for text chat to prevent abuse."""
+    now = time.time()
+    last_time = RATE_LIMIT.get(user_id, 0)
+    if now - last_time < 0.8: # 800ms limit between messages
+        return True
+    RATE_LIMIT[user_id] = now
+    return False
+
 async def track_user(user_id: int):
+    """Add user to database for broadcasting."""
     await db.execute("INSERT OR IGNORE INTO users (user_id, joined_at) VALUES (?, ?)", (user_id, int(time.time())))
 
 def get_file_info(msg: Message):
+    """Extract file details from a message."""
     media = msg.document or msg.video or msg.photo or msg.audio
     if not media: return None
 
-    if isinstance(media, list): media = media[-1]
+    if isinstance(media, list): media = media[-1] # High res photo
 
     f_id = media.file_id
     f_uid = media.file_unique_id
@@ -151,19 +167,23 @@ def get_file_info(msg: Message):
     caption = msg.caption or ""
     return f_id, f_uid, f_type, f_name, caption
 
-# --- 8. HANDLERS ---
+# --- 8. CORE HANDLERS ---
+
 @dp.message(CommandStart())
 async def start_handler(message: Message, command: CommandObject):
     await track_user(message.from_user.id)
     args = command.args
 
+    # 1. Normal Welcome (No Code)
     if not args:
         return await message.answer(
             f"👋 <b>Hello {message.from_user.first_name}!</b>\n\n"
-            "I am a secure file vault.\n"
-            "Send me a link to get your file."
+            "I am your Secure File Assistant.\n"
+            "📂 <b>To get a file:</b> Send me the link.\n"
+            "ℹ️ <b>Info:</b> Type /owner or /help."
         )
 
+    # 2. File Retrieval (With Code)
     code = args
     data = await db.execute("SELECT * FROM files WHERE code=?", (code,), fetch='one')
 
@@ -176,6 +196,7 @@ async def start_handler(message: Message, command: CommandObject):
     try:
         await bot.send_chat_action(message.chat.id, action=ChatAction.UPLOAD_DOCUMENT)
 
+        # Determine method based on type
         if data['file_type'] == "photo":
             await message.answer_photo(photo=data['file_id'], caption=data['caption'])
         elif data['file_type'] == "video":
@@ -191,45 +212,22 @@ async def start_handler(message: Message, command: CommandObject):
         logger.error(f"Send Error: {e}")
         await message.answer("❌ Failed to send file.")
 
-@dp.message(F.document | F.video | F.photo | F.audio)
-async def upload_handler(message: Message):
-    if message.from_user.id != ADMIN_ID:
-        return
+# --- 9. OWNER & INFO HANDLERS ---
 
-    status = await message.answer("⏳ <b>Processing...</b>")
-
-    try:
-        info = get_file_info(message)
-        if not info: return await status.edit_text("❌ Unknown media.")
-
-        f_id, f_uid, f_type, f_name, cap = info
-
-        exist = await db.execute("SELECT code FROM files WHERE file_unique_id=?", (f_uid,), fetch='one')
-
-        if exist:
-            code = exist['code']
-            new_file = False
-        else:
-            code = uuid.uuid4().hex[:10]
-            await db.execute(
-                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)",
-                (code, f_id, f_uid, f_type, f_name, cap, int(time.time()))
-            )
-            new_file = True
-
-        link = f"https://t.me/{BOT_USERNAME}?start={code}"
-
-        await status.edit_text(
-            f"{'✅ <b>New File</b>' if new_file else 'ℹ️ <b>File Exists</b>'}\n\n"
-            f"📂 Type: {f_type}\n"
-            f"🔗 Link:\n<code>{link}</code>"
-        )
-    except Exception as e:
-        logger.error(f"Upload: {e}")
-        await status.edit_text("❌ Error saving file.")
+@dp.message(Command("owner"))
+async def owner_command(message: Message):
+    """Responds to /owner command."""
+    await message.answer(
+        "👤 <b>Owner Information</b>\n\n"
+        "<b>Name:</b> Its Light\n"
+        "<b>Telegram:</b> @OfficialItslightMourya\n"
+        "<b>Email:</b> ayushmourya881@gmail.com\n\n"
+        "<i>Feel free to contact for inquiries!</i>"
+    )
 
 @dp.message(Command("stats"))
 async def stats_handler(message: Message):
+    """Admin only stats."""
     if message.from_user.id != ADMIN_ID: return
 
     files = await db.execute("SELECT COUNT(*), SUM(downloads) FROM files", fetch='one')
@@ -244,6 +242,7 @@ async def stats_handler(message: Message):
 
 @dp.message(Command("broadcast"))
 async def broadcast_handler(message: Message):
+    """Admin only broadcast."""
     if message.from_user.id != ADMIN_ID: return
     if not message.reply_to_message:
         return await message.answer("⚠️ Reply to a message to broadcast.")
@@ -252,7 +251,6 @@ async def broadcast_handler(message: Message):
     users = await db.execute("SELECT user_id FROM users", fetch='all')
 
     sent, failed = 0, 0
-
     for row in users:
         user_id = row['user_id']
         try:
@@ -272,15 +270,99 @@ async def broadcast_handler(message: Message):
         except (TelegramForbiddenError, TelegramBadRequest):
             await db.execute("DELETE FROM users WHERE user_id=?", (user_id,))
             failed += 1
-        except Exception as e:
-            logger.error(f"Broadcast fail {user_id}: {e}")
+        except Exception:
             failed += 1
 
     await status.edit_text(f"✅ <b>Done</b>\nSent: {sent}\nFailed/Blocked: {failed}")
 
-# --- 9. STARTUP ---
+# --- 10. INTELLIGENT CHAT HANDLER ---
+
+@dp.message(F.text)
+async def chat_intelligence(message: Message):
+    """Handles text messages, keywords, greetings, and fallbacks."""
+
+    # 1. Spam Check
+    if is_spamming(message.from_user.id):
+        return # Ignore spammers
+
+    text = message.text.lower().strip()
+
+    # 2. Owner Keywords
+    owner_keywords = ["owner", "creator", "developer", "who made you", "admin info"]
+    if any(k in text for k in owner_keywords):
+        return await owner_command(message)
+
+    # 3. Greetings & Appreciation
+    greetings = ["hi", "hello", "hey", "good morning", "hola", "start"]
+    if text in greetings:
+        return await message.answer(f"👋 Hello <b>{message.from_user.first_name}</b>! How can I help you today?")
+
+    if "thank" in text or "thx" in text:
+        return await message.answer("😊 You're welcome! Happy to help.")
+
+    if "help" in text:
+        return await message.answer(
+            "🛠 <b>Bot Help</b>\n\n"
+            "• Send <b>/owner</b> for creator info.\n"
+            "• If you have a file link, just send it here.\n"
+            "• Admins can upload files by sending them."
+        )
+
+    # 4. Smart Fallback (Private Chat Only)
+    if message.chat.type == "private":
+        await message.answer(
+            "🤖 <b>I didn't catch that.</b>\n\n"
+            "I'm a file sharing assistant. You can:\n"
+            "• Send /start to refresh\n"
+            "• Send /owner for info\n"
+            "• Send a file link to download"
+        )
+
+# --- 11. FILE UPLOAD (ADMIN ONLY) ---
+
+@dp.message(F.document | F.video | F.photo | F.audio)
+async def upload_handler(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        # Ignore uploads from non-admins to prevent spam
+        return
+
+    status = await message.answer("⏳ <b>Securing File...</b>")
+
+    try:
+        info = get_file_info(message)
+        if not info: return await status.edit_text("❌ Unknown media.")
+
+        f_id, f_uid, f_type, f_name, cap = info
+
+        # Deduplication
+        exist = await db.execute("SELECT code FROM files WHERE file_unique_id=?", (f_uid,), fetch='one')
+
+        if exist:
+            code = exist['code']
+            is_new = False
+        else:
+            code = uuid.uuid4().hex[:10]
+            await db.execute(
+                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?, 0, 1)",
+                (code, f_id, f_uid, f_type, f_name, cap, int(time.time()))
+            )
+            is_new = True
+
+        link = f"https://t.me/{BOT_USERNAME}?start={code}"
+
+        await status.edit_text(
+            f"{'✅ <b>File Secured</b>' if is_new else 'ℹ️ <b>Already Exists</b>'}\n\n"
+            f"📂 Type: {f_type}\n"
+            f"🔗 Link:\n<code>{link}</code>"
+        )
+    except Exception as e:
+        logger.error(f"Upload Error: {e}")
+        await status.edit_text("❌ Database Error.")
+
+# --- 12. RUNNER ---
 async def main():
     print(f"✅ Bot Started: @{BOT_USERNAME}")
+    # Drop pending to avoid notification flood
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
