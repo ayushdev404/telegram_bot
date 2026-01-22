@@ -8,6 +8,9 @@ import uuid
 import atexit
 import warnings
 from typing import Tuple, Optional
+from keep_alive import keep_alive
+
+keep_alive()
 
 # --- 1. SETUP & PATHS ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
